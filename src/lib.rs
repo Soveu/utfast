@@ -1,7 +1,7 @@
-#![feature(asm)]
 #![feature(array_windows)]
 
 /*
+#![feature(asm)]
 fn x86_leading_zeros(mut x: u32) -> u32 {
     unsafe {
         asm!("
@@ -22,77 +22,7 @@ fn x86_leading_ones(mut x: u32) -> u32 {
 }
 */
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /*
-    #[test]
-    fn test_bsr() {
-        for i in 0..32 {
-            let i = !(1u32 << i);
-            assert_eq!(x86_leading_ones(i), i.leading_ones());
-        }
-    }
-
-    #[test]
-    fn edge_bsr() {
-        assert_eq!(x86_leading_ones(!0), (!0u32).leading_ones());
-    }
-    */
-
-    #[test]
-    fn smol_test() {
-        let bytes = "qwertyuiopasdfghjklzxcvbnm,.;'[]1234567890-=πœę©ß←↓→óþąśðæŋ’ə…łżźć„”ńµQWERTYUIOPASDFGHJKLZXCVBNM<>?L:{}|!@#$%^&*()_+ΩŒĘ®™¥↑↔ÓÞĄŚÐÆŊ•ƏŻŹĆ‘“Ń∞";
-        let _ = check_utf8(bytes.as_bytes()).unwrap();
-    }
-
-    fn xorshift(mut x: u32) -> u32 {
-        x ^= x << 13;
-        x ^= x >> 17;
-        x ^= x << 5;
-        return x;
-    }
-    fn xorshift64(mut x: u64) -> u64 {
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x >> 17;
-        return x;
-    }
-
-    #[test]
-    fn big_test() {
-        let mut seed = 0x42;
-
-        for _ in 0..100_000_000 {
-            seed = xorshift(seed);
-            let bytes = seed.to_ne_bytes();
-            
-            let std = std::str::from_utf8(&bytes);
-            let this = check_utf8_v2(&bytes);
-
-            if std.is_ok() && this.is_ok() {
-                continue;
-            }
-            if std.is_err() && this.is_err() {
-                let thiserr = this.unwrap_err();
-                let stderr = std.unwrap_err();
-                if stderr.valid_up_to() != thiserr {
-                    eprintln!("buffer: {:?}", bytes);
-                    eprintln!("stderr: {:?}", stderr);
-                    eprintln!("diserr: {:?}", thiserr);
-                    panic!();
-                }
-                continue;
-            }
-            
-            eprintln!("buffer={:?}", bytes);
-            panic!("std: {:?}\nthis: {:?}", std, this);
-        }
-    }
-}
-
-pub fn check_utf8(s: &[u8]) -> Result<(), usize> {
+pub fn check_utf8_v1(s: &[u8]) -> Result<(), usize> {
     let mut iter = s.array_windows::<4>();
     let mut bytes = 0u32;
     let mut stop = 0usize;
@@ -170,7 +100,6 @@ pub fn check_utf8(s: &[u8]) -> Result<(), usize> {
         Ok(_) => Ok(()),
         Err(e) => Err(e.valid_up_to() + stop),
     };
-
 }
 
 pub fn __check_utf8_v2(packed_codepoints: u32) -> Result<char, ()> {
@@ -246,7 +175,7 @@ pub fn check_utf8_v2(s: &[u8]) -> Result<(), usize> {
         let all_ascii_mask = 0x80808080u32;
         if dword & all_ascii_mask == 0 {
             stop += 4;
-            bytes = 4;
+            bytes = 3;
             continue;
         }
 
@@ -281,3 +210,74 @@ pub fn check_utf8_v2(s: &[u8]) -> Result<(), usize> {
 
     return Ok(());
 }
+
+pub fn __check_utf16(packed_codepoints: u32) -> Result<char, ()> {
+    let first_word = packed_codepoints as u16;
+    let other_word = packed_codepoints >> 16;
+
+    if let Some(c) = char::from_u32(first_word as u32) {
+        return Ok(c);
+    }
+    if !(0xD800..=0xDBFF).contains(&first_word) {
+        return Err(());
+    }
+    if !(0xDC00..0xE000).contains(&other_word) {
+        return Err(());
+    }
+
+    let mask = 0x3FFu32; // Mask to extract 10 first bits
+    let first_bits = first_word as u32 & mask;
+    let character = (first_bits << 10) | (other_word & mask);
+
+    /* Adding makes rustc think we go OOB and the following char::from_u32
+     * is not a noop, so instead we just OR */
+    let character = character | 0x10000;
+
+    return Ok(char::from_u32(character).unwrap());
+}
+
+fn u32_from_le_words(x: [u16; 2]) -> u32 {
+    let a = x[0] as u32;
+    let b = x[1] as u32;
+    (a << 0) | (b << 16)
+}
+
+pub fn check_utf16(s: &[u16]) -> Result<(), usize> {
+    let mut iter = s.array_windows::<2>();
+    let mut stop = 0usize;
+    let mut bytes = 0usize;
+
+    while let Some(window) = iter.nth(bytes as usize) {
+        let dword = u32_from_le_words(*window);
+
+        let mask = 0xF800_F800u32;
+        if dword & mask != 0xD800_D800u32 {
+            stop += 2;
+            bytes = 1;
+            continue;
+        }
+
+        bytes = match __check_utf16(dword) {
+            Ok(c) => c.len_utf16(),
+            Err(()) => return Err(stop),
+        };
+
+        stop += bytes;
+        bytes -= 1;
+    }
+
+    if stop == s.len() {
+        return Ok(());
+    }
+
+    if let Some(last) = s.last() {
+        let dword = u32_from_le_words([*last, 0xD800]);
+        match __check_utf16(dword) {
+            Ok(_) => return Ok(()),
+            Err(()) => return Err(stop),
+        }
+    }
+
+    return Ok(());
+}
+
